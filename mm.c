@@ -44,7 +44,8 @@ team_t team = {
 #define CHUNKSIZE mem_pagesize()                            // initial heap size
 #define MINIMUM_ALLOC 2 * sizeof(int)                       // minimum block size
 #define MINIMUM_UNALLOC MINIMUM_ALLOC + 2 * sizeof(block *) // minimum block size
-#define FIT_SEARCH_DEPTH 1 << 31 // maximum block searched before switching to first fit
+#define FIT_SEARCH_DEPTH 1 << 31    // maximum block searched before switching to first fit
+#define LARGE_OBJECT_THRESHOLD 64 // bytes
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -86,15 +87,15 @@ static inline int get_list_index(size_t size) {
     // Handle minimum allocation size (typically 16 or 32 bytes)
     if (size <= 32)
         return 0;
-    
+
     // Use leading zeros to find the most significant bit position
     // which effectively gives us log2(size) and maps to appropriate bucket
     int msb = 31 - __builtin_clz((unsigned int)size);
-    
+
     // Fine-tune index based on the size range
     // This maps sizes to appropriate lists based on their magnitude
-    int index = msb - 4;  // Subtract 4 because 2^5=32 is our first threshold
-    
+    int index = msb - 4; // Subtract 4 because 2^5=32 is our first threshold
+
     // Ensure index is within bounds [0, NUM_LISTS-1]
     return (index < 0) ? 0 : (index >= NUM_LISTS) ? NUM_LISTS - 1 : index;
 }
@@ -105,7 +106,7 @@ static block *seg_lists[NUM_LISTS]; // array of segregated free list heads
 
 // function prototypes for internal helper routines
 static void *extend_heap(size_t words);
-static void place(block *bp, size_t asize);
+static void *place(block *bp, size_t asize);
 static void *find_fit(size_t asize);
 static void *coalesce(void *bp);
 static void insert_free_block(void *bp);
@@ -113,6 +114,8 @@ static void remove_free_block(block *bp);
 static int get_list_index(size_t size);
 static int mm_check();
 
+#define SMALL_INIT_SIZE 256        // Size of each small block in bytes
+#define SMALL_INIT_AMT 2         // Number of small blocks to create
 /*
  * mm_init - Initialize the memory manager
  */
@@ -135,6 +138,33 @@ int mm_init(void) {
     // extend the empty heap with a free block of CHUNKSIZE bytes
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
+    
+    // Get the pointer to the first free block 
+    block *bp = NEXT_BLKP(heap_listp);
+    size_t total_size = GET_SIZE(HDRP(bp));
+    
+    // Calculate size needed for small blocks
+    size_t small_blocks_total_size = SMALL_INIT_AMT * SMALL_INIT_SIZE;
+    
+    // Make sure we have enough space
+    if (small_blocks_total_size + MINIMUM_UNALLOC <= total_size) {
+        // Remove the big block from free list
+        remove_free_block(bp);
+        
+        // Create the small blocks
+        for (int i = 0; i < SMALL_INIT_AMT; i++) {
+            PUT(HDRP(bp), PACK(SMALL_INIT_SIZE, 0));
+            PUT(FTRP(bp), PACK(SMALL_INIT_SIZE, 0));
+            insert_free_block(bp);
+            bp = NEXT_BLKP(bp);
+        }
+        
+        // Create the remaining large block
+        size_t remaining_size = total_size - small_blocks_total_size;
+        PUT(HDRP(bp), PACK(remaining_size, 0));
+        PUT(FTRP(bp), PACK(remaining_size, 0));
+        insert_free_block(bp);
+    }
 
     return 0;
 }
@@ -158,8 +188,7 @@ void *mm_malloc(size_t size) {
 
     // search the free list for a fit
     if ((bp = find_fit(asize)) != NULL) {
-        place(bp, asize);
-        return bp;
+        return place(bp, asize);
     }
 
     // no fit found. get more memory and place the block
@@ -167,8 +196,7 @@ void *mm_malloc(size_t size) {
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
 
-    place(bp, asize);
-    return bp;
+    return place(bp, asize);
 }
 
 /*
@@ -331,28 +359,53 @@ static void *coalesce(void *bp) {
  * place - Place block of asize bytes at start of free block bp
  *         and split if remainder would be at least minimum block size
  */
-static void place(block *bp, size_t asize) {
+static void *place(block *bp, size_t asize) {
     size_t csize = GET_SIZE(HDRP(bp));
+    block *allocated_bp = bp;  // By default, we'll allocate at bp
 
     // remove the block from the free list
     remove_free_block(bp);
 
     // if the remaining part is large enough for a new free block
     if ((csize - asize) >= MINIMUM_UNALLOC) {
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize - asize, 0));
-        PUT(FTRP(bp), PACK(csize - asize, 0));
-        insert_free_block(bp);
+        // For large objects (>2048 bytes), place them on the right side of the block
+        if (asize > LARGE_OBJECT_THRESHOLD) {
+            // Save the location where the allocated block will go
+            allocated_bp = (char*)bp + (csize - asize);
+            
+            // Create free block on the left side
+            PUT(HDRP(bp), PACK(csize - asize, 0));
+            PUT(FTRP(bp), PACK(csize - asize, 0));
+            
+            // Place allocated block on the right side
+            PUT(HDRP(allocated_bp), PACK(asize, 1));
+            PUT(FTRP(allocated_bp), PACK(asize, 1));
+            
+            // Add the free block back to the free list
+            insert_free_block(bp);
+        }
+        // For smaller objects, place them on the left side (original behavior)
+        else {
+            PUT(HDRP(bp), PACK(asize, 1));
+            PUT(FTRP(bp), PACK(asize, 1));
+            
+            // Create free block on the right side
+            block *free_bp = NEXT_BLKP(bp);
+            PUT(HDRP(free_bp), PACK(csize - asize, 0));
+            PUT(FTRP(free_bp), PACK(csize - asize, 0));
+            
+            // Add the free block to the free list
+            insert_free_block(free_bp);
+        }
     }
     // otherwise use the entire block
     else {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
+    
+    return allocated_bp;
 }
-
 /*
  * find_fit - Find a fit for a block with asize bytes
  */
@@ -389,7 +442,6 @@ static void *find_fit(size_t asize) {
 
             // Move to next block and increment depth counter
             bp = GET_NEXT(bp);
-            ;
             depth++;
         }
 
