@@ -1,10 +1,8 @@
 /*
- * mm.c - Dynamic memory allocator using segregated free lists
+ * mm.c - memory allocator using segregated free lists
  *
- * This implementation uses segregated free lists to efficiently manage memory.
- * Each size class has its own free list, which helps to reduce fragmentation
- * and improve allocation performance. The allocator uses an explicit free list
- * with boundary tags to support efficient coalescing.
+ * I'm using segregated free lists.
+ * Boundary tags to support efficient coalescing.
  *
  * Block structure:
  * - Allocated block: [header][payload][padding]
@@ -13,7 +11,10 @@
  * Free list organization:
  * - Multiple segregated free lists based on block size class
  * - Each list is maintained as an explicit doubly-linked list
- * - Lists are sorted by address to improve coalescing efficiency
+ *
+ * Weird rules:
+ * - Large allocations that will split large blocks into 2 get allocated to the right side while
+ * small ones get allocated to the left side
  */
 
 #include <assert.h>
@@ -29,7 +30,7 @@
 
 team_t team = {
     /* Team name */
-    "DynamicMemory",
+    "sky",
     /* First member's full name */
     "Skylar Abruzese",
     /* First member's email address */
@@ -39,13 +40,14 @@ team_t team = {
     /* Second member's email address (leave blank if none) */
     ""};
 
-#define WSIZE 4                                             // word size
-#define DSIZE 8                                             // double word size
-#define CHUNKSIZE mem_pagesize()                            // initial heap size
-#define MINIMUM_ALLOC 2 * sizeof(int)                       // minimum block size
-#define MINIMUM_UNALLOC MINIMUM_ALLOC + 2 * sizeof(block *) // minimum block size
-#define FIT_SEARCH_DEPTH 1 << 31    // maximum block searched before switching to first fit
+#define WSIZE 4
+#define DSIZE 8
+#define CHUNKSIZE mem_pagesize()
+#define MINIMUM_ALLOC 2 * sizeof(int)
+#define MINIMUM_UNALLOC MINIMUM_ALLOC + 2 * sizeof(block *)
+#define FIT_SEARCH_DEPTH 1 << 30  // maximum block searched before switching to first fit
 #define LARGE_OBJECT_THRESHOLD 64 // bytes
+#define SPLIT_IF_REMAINDER_BIGGER_THAN MINIMUM_UNALLOC
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -82,21 +84,15 @@ typedef void block;
 // Number of segregated free lists and their size thresholds
 #define NUM_LISTS 16
 
-// Optimized list index calculation using bit manipulation
 static inline int get_list_index(size_t size) {
-    // Handle minimum allocation size (typically 16 or 32 bytes)
     if (size <= 32)
         return 0;
 
-    // Use leading zeros to find the most significant bit position
-    // which effectively gives us log2(size) and maps to appropriate bucket
     int msb = 31 - __builtin_clz((unsigned int)size);
 
-    // Fine-tune index based on the size range
-    // This maps sizes to appropriate lists based on their magnitude
     int index = msb - 4; // Subtract 4 because 2^5=32 is our first threshold
 
-    // Ensure index is within bounds [0, NUM_LISTS-1]
+    // ensure index is within bounds [0, NUM_LISTS-1]
     return (index < 0) ? 0 : (index >= NUM_LISTS) ? NUM_LISTS - 1 : index;
 }
 
@@ -114,8 +110,10 @@ static void remove_free_block(block *bp);
 static int get_list_index(size_t size);
 static int mm_check();
 
-#define SMALL_INIT_SIZE 256        // Size of each small block in bytes
-#define SMALL_INIT_AMT 2         // Number of small blocks to create
+// this didn't really improve anything
+#define SMALL_INIT_SIZE 256 // size of each small block in bytes
+#define SMALL_INIT_AMT 0    // number of small blocks to create
+
 /*
  * mm_init - Initialize the memory manager
  */
@@ -138,28 +136,28 @@ int mm_init(void) {
     // extend the empty heap with a free block of CHUNKSIZE bytes
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
-    
-    // Get the pointer to the first free block 
+
+    // het the pointer to the first free block
     block *bp = NEXT_BLKP(heap_listp);
     size_t total_size = GET_SIZE(HDRP(bp));
-    
-    // Calculate size needed for small blocks
+
+    // calculate size needed for small blocks
     size_t small_blocks_total_size = SMALL_INIT_AMT * SMALL_INIT_SIZE;
-    
-    // Make sure we have enough space
-    if (small_blocks_total_size + MINIMUM_UNALLOC <= total_size) {
-        // Remove the big block from free list
+
+    // make sure we have enough space
+    if (small_blocks_total_size + MINIMUM_UNALLOC <= total_size && SMALL_INIT_AMT > 0) {
+        // remove the big block from free list
         remove_free_block(bp);
-        
-        // Create the small blocks
+
+        // create the small blocks
         for (int i = 0; i < SMALL_INIT_AMT; i++) {
             PUT(HDRP(bp), PACK(SMALL_INIT_SIZE, 0));
             PUT(FTRP(bp), PACK(SMALL_INIT_SIZE, 0));
             insert_free_block(bp);
             bp = NEXT_BLKP(bp);
         }
-        
-        // Create the remaining large block
+
+        // create the remaining large block
         size_t remaining_size = total_size - small_blocks_total_size;
         PUT(HDRP(bp), PACK(remaining_size, 0));
         PUT(FTRP(bp), PACK(remaining_size, 0));
@@ -304,7 +302,7 @@ static void *extend_heap(size_t words) {
     // initialize free block header/footer and the epilogue header
     PUT(HDRP(bp), PACK(size, 0));         // free block header
     PUT(FTRP(bp), PACK(size, 0));         // free block footer
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); // new epilogue header
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); // new next header
 
     // coalesce if the previous block was free
     return coalesce(bp);
@@ -361,26 +359,26 @@ static void *coalesce(void *bp) {
  */
 static void *place(block *bp, size_t asize) {
     size_t csize = GET_SIZE(HDRP(bp));
-    block *allocated_bp = bp;  // By default, we'll allocate at bp
+    block *allocated_bp = bp; // By default, we'll allocate at bp
 
     // remove the block from the free list
     remove_free_block(bp);
 
     // if the remaining part is large enough for a new free block
-    if ((csize - asize) >= MINIMUM_UNALLOC) {
+    if ((csize - asize) >= SPLIT_IF_REMAINDER_BIGGER_THAN) {
         // For large objects (>2048 bytes), place them on the right side of the block
         if (asize > LARGE_OBJECT_THRESHOLD) {
             // Save the location where the allocated block will go
-            allocated_bp = (char*)bp + (csize - asize);
-            
+            allocated_bp = (char *)bp + (csize - asize);
+
             // Create free block on the left side
             PUT(HDRP(bp), PACK(csize - asize, 0));
             PUT(FTRP(bp), PACK(csize - asize, 0));
-            
+
             // Place allocated block on the right side
             PUT(HDRP(allocated_bp), PACK(asize, 1));
             PUT(FTRP(allocated_bp), PACK(asize, 1));
-            
+
             // Add the free block back to the free list
             insert_free_block(bp);
         }
@@ -388,12 +386,12 @@ static void *place(block *bp, size_t asize) {
         else {
             PUT(HDRP(bp), PACK(asize, 1));
             PUT(FTRP(bp), PACK(asize, 1));
-            
+
             // Create free block on the right side
             block *free_bp = NEXT_BLKP(bp);
             PUT(HDRP(free_bp), PACK(csize - asize, 0));
             PUT(FTRP(free_bp), PACK(csize - asize, 0));
-            
+
             // Add the free block to the free list
             insert_free_block(free_bp);
         }
@@ -403,9 +401,10 @@ static void *place(block *bp, size_t asize) {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
-    
+
     return allocated_bp;
 }
+
 /*
  * find_fit - Find a fit for a block with asize bytes
  */
