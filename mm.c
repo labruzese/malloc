@@ -44,7 +44,7 @@ team_t team = {
 #define CHUNKSIZE mem_pagesize()                            // initial heap size
 #define MINIMUM_ALLOC 2 * sizeof(int)                       // minimum block size
 #define MINIMUM_UNALLOC MINIMUM_ALLOC + 2 * sizeof(block *) // minimum block size
-#define FIT_SEARCH_DEPTH 1<<31 // maximum block searched before switching to first fit
+#define FIT_SEARCH_DEPTH 1 << 31 // maximum block searched before switching to first fit
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -78,30 +78,25 @@ typedef void block;
 #define SET_NEXT(bp, next) (*(block **)NEXT_PTR(bp) = next)
 #define SET_PREV(bp, prev) (*(block **)PREV_PTR(bp) = prev)
 
-// number of segregated free lists and their size thresholds
-#define NUM_LISTS 10
+// Number of segregated free lists and their size thresholds
+#define NUM_LISTS 16
 
-static int get_list_index(size_t size) {
+// Optimized list index calculation using bit manipulation
+static inline int get_list_index(size_t size) {
+    // Handle minimum allocation size (typically 16 or 32 bytes)
     if (size <= 32)
         return 0;
-    else if (size <= 64)
-        return 1;
-    else if (size <= 128)
-        return 2;
-    else if (size <= 256)
-        return 3;
-    else if (size <= 512)
-        return 4;
-    else if (size <= 1024)
-        return 5;
-    else if (size <= 2048)
-        return 6;
-    else if (size <= 4096)
-        return 7;
-    else if (size <= 8192)
-        return 8;
-    else
-        return 9;
+    
+    // Use leading zeros to find the most significant bit position
+    // which effectively gives us log2(size) and maps to appropriate bucket
+    int msb = 31 - __builtin_clz((unsigned int)size);
+    
+    // Fine-tune index based on the size range
+    // This maps sizes to appropriate lists based on their magnitude
+    int index = msb - 4;  // Subtract 4 because 2^5=32 is our first threshold
+    
+    // Ensure index is within bounds [0, NUM_LISTS-1]
+    return (index < 0) ? 0 : (index >= NUM_LISTS) ? NUM_LISTS - 1 : index;
 }
 
 // global variables
@@ -116,6 +111,7 @@ static void *coalesce(void *bp);
 static void insert_free_block(void *bp);
 static void remove_free_block(block *bp);
 static int get_list_index(size_t size);
+static int mm_check();
 
 /*
  * mm_init - Initialize the memory manager
@@ -151,7 +147,6 @@ void *mm_malloc(size_t size) {
     size_t extendsize; // amount to extend heap if no fit
     block *bp;
 
-    // ignore spurious requests
     if (size == 0)
         return NULL;
 
@@ -393,7 +388,8 @@ static void *find_fit(size_t asize) {
             }
 
             // Move to next block and increment depth counter
-            bp = GET_NEXT(bp);;
+            bp = GET_NEXT(bp);
+            ;
             depth++;
         }
 
