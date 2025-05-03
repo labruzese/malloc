@@ -48,6 +48,7 @@ team_t team = {
 #define FIT_SEARCH_DEPTH 1 << 30  // maximum block searched before switching to first fit
 #define LARGE_OBJECT_THRESHOLD 64 // bytes
 #define SPLIT_IF_REMAINDER_BIGGER_THAN MINIMUM_UNALLOC
+#define REALLOC_BUFFER 1
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -87,10 +88,18 @@ typedef void block;
 static inline int get_list_index(size_t size) {
     if (size <= 32)
         return 0;
+    else if (size <= 48)
+        return 1;
+    else if (size <= 64)
+        return 2;
+    else if (size <= 96)
+        return 3;
+    else if (size <= 128)
+        return 4;
 
     int msb = 31 - __builtin_clz((unsigned int)size);
 
-    int index = msb - 4; // Subtract 4 because 2^5=32 is our first threshold
+    int index = msb - 6 + 4; // 2^7=128 is our first few thresholds
 
     // ensure index is within bounds [0, NUM_LISTS-1]
     return (index < 0) ? 0 : (index >= NUM_LISTS) ? NUM_LISTS - 1 : index;
@@ -243,7 +252,7 @@ void *mm_realloc(void *ptr, size_t size) {
     // if the new size is smaller than the old size, we can just shrink
     if (asize <= oldsize) {
         // only split if the remaining chunk would be large enough
-        if (oldsize - asize >= 2 * DSIZE) {
+        if (oldsize - asize >= MINIMUM_UNALLOC) {
             PUT(HDRP(oldptr), PACK(asize, 1));
             PUT(FTRP(oldptr), PACK(asize, 1));
             block *next_bp = NEXT_BLKP(oldptr);
@@ -268,7 +277,7 @@ void *mm_realloc(void *ptr, size_t size) {
     }
 
     // otherwise, we need to allocate a new block
-    newptr = mm_malloc(size);
+    newptr = mm_malloc(size*REALLOC_BUFFER);
     if (newptr == NULL)
         return NULL;
 
