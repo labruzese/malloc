@@ -316,6 +316,9 @@ static struct {
     unsigned long search_depth_sum;     // Sum of depths searched
     unsigned long searches;             // Number of searches performed
     
+    // Memory layout visualization
+    char *heap_start;                   // Start address of heap for visualization
+    
     // Time-based statistics (not implemented, would need timer)
 } stats = {0};
 
@@ -336,6 +339,8 @@ static int get_size_bucket(size_t size) {
 void mm_reset_stats() {
     memset(&stats, 0, sizeof(stats));
 }
+
+void mm_print_heap_layout();
 
 // Print memory usage statistics
 void mm_print_stats() {
@@ -428,6 +433,9 @@ void mm_print_stats() {
     }
     
     printf("\n==============================================\n");
+    
+    // Also print the heap layout
+    mm_print_heap_layout();
 }
 
 // Calculate internal fragmentation (wasted space within allocated blocks)
@@ -510,6 +518,213 @@ static void update_all_stats() {
     
     // Update overhead statistics
     update_overhead_stats();
+    
+    // Store heap start for visualization
+    stats.heap_start = mem_heap_lo();
+}
+
+// Function to print a visual representation of the heap layout
+void mm_print_heap_layout() {
+    block *bp;
+    size_t total_bytes = 0;
+    size_t block_count = 0;
+    char status_char;
+    char header_details[256];
+    int char_width = 40; // Width of the layout visualization in characters
+
+    printf("\n==============================================\n");
+    printf("MEMORY HEAP LAYOUT\n");
+    printf("==============================================\n");
+    printf("Each block shown with: [size in bytes](status)(index/addr)\n");
+    printf("Status: A=Allocated, F=Free, P=Prologue, E=Epilogue\n\n");
+    
+    // First, print detailed block information
+    printf("DETAILED BLOCK INFORMATION:\n");
+    printf("%-5s %-12s %-10s %-10s %-20s %-10s\n",
+           "Idx", "Address", "Size", "Status", "List Index", "Payload");
+    printf("-------------------------------------------------------------------------\n");
+
+    // Start at the beginning of the heap (after prologue)
+    bp = heap_listp;
+    
+    // Print prologue block
+    printf("%-5lu 0x%-10lx %-10s %-10s %-20s %-10s\n",
+           block_count++, (unsigned long)bp, "8", "PROLOGUE", "N/A", "N/A");
+    
+    // Advance to first real block
+    bp = PTR_NEXT_BLK(heap_listp);
+    
+    // Walk through the heap
+    while (GET_SIZE(HDR_PTR(bp)) > 0) {
+        size_t size = GET_SIZE(HDR_PTR(bp));
+        int allocated = GET_ALLOC(HDR_PTR(bp));
+        total_bytes += size;
+        
+        // Determine status
+        const char* status = allocated ? "ALLOCATED" : "FREE";
+        
+        // Determine list index for free blocks
+        int list_idx = -1;
+        if (!allocated) {
+            list_idx = get_list_index(size);
+        }
+        
+        // Print block details
+        printf("%-5lu 0x%-10lx %-10lu %-10s %-20d %-10lu\n",
+               block_count++, (unsigned long)bp, size, status, 
+               list_idx, allocated ? size - DSIZE : size - DSIZE - 2 * sizeof(block *));
+        
+        // Move to next block
+        bp = PTR_NEXT_BLK(bp);
+    }
+    
+    // Print epilogue block
+    printf("%-5lu 0x%-10lx %-10s %-10s %-20s %-10s\n",
+           block_count++, (unsigned long)bp, "0", "EPILOGUE", "N/A", "N/A");
+    
+    printf("-------------------------------------------------------------------------\n");
+    printf("Total heap size: %lu bytes\n\n", total_bytes);
+    
+    // Now print a visual representation of the heap
+    printf("VISUAL HEAP LAYOUT:\n");
+    printf("(Each character represents approximately %lu bytes)\n\n", 
+           stats.total_heap_size / char_width > 0 ? stats.total_heap_size / char_width : 1);
+    
+    // Create a scaled representation where the width of block visualization
+    // is proportional to its size relative to total heap
+    double bytes_per_char = (double)stats.total_heap_size / char_width;
+    
+    // Print header line with byte positions
+    printf("Byte:  ");
+    for (int i = 0; i < char_width; i += 10) {
+        printf("%-10d", (int)(i * bytes_per_char));
+    }
+    printf("\n");
+    
+    // Print ruler line
+    printf("       |");
+    for (int i = 1; i < char_width; i++) {
+        if (i % 10 == 0) printf("|");
+        else printf("-");
+    }
+    printf("|\n");
+    
+    // Print memory layout
+    printf("Layout: ");
+    
+    // Reset to start of heap
+    bp = heap_listp;
+    
+    // Print prologue
+    printf("P");
+    
+    // Start from the first actual block
+    bp = PTR_NEXT_BLK(heap_listp);
+    
+    double chars_printed = 1; // Account for prologue
+    
+    // Walk through the heap to create visual representation
+    while (GET_SIZE(HDR_PTR(bp)) > 0) {
+        size_t size = GET_SIZE(HDR_PTR(bp));
+        int allocated = GET_ALLOC(HDR_PTR(bp));
+        
+        // Determine status character
+        status_char = allocated ? 'A' : 'F';
+        
+        // Calculate how many characters this block should occupy
+        double block_width = size / bytes_per_char;
+        
+        // Print the block (at least 1 character)
+        for (int i = 0; i < (int)(block_width + 0.5) && chars_printed < char_width - 1; i++) {
+            printf("%c", status_char);
+            chars_printed++;
+        }
+        
+        // Move to next block
+        bp = PTR_NEXT_BLK(bp);
+    }
+    
+    // Print epilogue if there's space left
+    if (chars_printed < char_width) {
+        printf("E");
+    }
+    
+    printf("\n\n");
+    
+    // Additional section: memory map with payload/overhead breakdown
+    printf("MEMORY UTILIZATION MAP:\n");
+    printf("A=Allocated payload, O=Overhead, F=Free, I=Internal fragmentation\n\n");
+    
+    // Reset to start of heap
+    bp = heap_listp;
+    
+    // Print prologue
+    printf("O"); // Prologue is overhead
+    
+    // Start from the first actual block
+    bp = PTR_NEXT_BLK(heap_listp);
+    
+    chars_printed = 1; // Account for prologue
+    
+    // Walk through the heap again for utilization map
+    while (GET_SIZE(HDR_PTR(bp)) > 0) {
+        size_t size = GET_SIZE(HDR_PTR(bp));
+        int allocated = GET_ALLOC(HDR_PTR(bp));
+        
+        // Calculate how many characters this block should occupy
+        double block_width = size / bytes_per_char;
+        int block_chars = (int)(block_width + 0.5);
+        
+        if (allocated) {
+            // For allocated blocks, show header/footer as overhead
+            // and the rest as payload (with internal fragmentation)
+            
+            // Show header as overhead (at least 1 char)
+            int overhead_chars = (int)((double)DSIZE / bytes_per_char + 0.5);
+            if (overhead_chars < 1) overhead_chars = 1;
+            
+            // Don't print more than the block width
+            overhead_chars = (overhead_chars > block_chars) ? block_chars : overhead_chars;
+            
+            // Print header overhead
+            for (int i = 0; i < overhead_chars/2 && chars_printed < char_width - 1; i++) {
+                printf("O");
+                chars_printed++;
+            }
+            
+            // Calculate payload area
+            int payload_chars = block_chars - overhead_chars;
+            if (payload_chars < 1) payload_chars = 1;
+            
+            // Print payload
+            for (int i = 0; i < payload_chars && chars_printed < char_width - 1; i++) {
+                printf("A");
+                chars_printed++;
+            }
+            
+            // Print footer overhead
+            for (int i = 0; i < overhead_chars/2 && chars_printed < char_width - 1; i++) {
+                printf("O");
+                chars_printed++;
+            }
+        } else {
+            // For free blocks, they're all marked as free
+            for (int i = 0; i < block_chars && chars_printed < char_width - 1; i++) {
+                printf("F");
+                chars_printed++;
+            }
+        }
+        
+        // Move to next block
+        bp = PTR_NEXT_BLK(bp);
+    }
+    
+    // Print epilogue if there's space left
+    if (chars_printed < char_width) {
+        printf("O"); // Epilogue is overhead
+    }
+    
+    printf("\n\n");
 }
 
 //=============================================================================
@@ -625,7 +840,7 @@ void *mm_malloc(size_t size) {
     }
 
     // no fit found. get more memory and place the block
-    extendsize = MAX(asize, CHUNKSIZE);
+    extendsize = MAX(asize, 1.5*CHUNKSIZE);
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
 
@@ -652,7 +867,7 @@ void *mm_malloc(size_t size) {
     // Update comprehensive statistics
     update_all_stats();
 
-    mm_print_stats();
+    mm_print_heap_layout();
 
     return allocated;
 }
@@ -1256,3 +1471,81 @@ int mm_check(void) {
 
     return correct;
 }
+
+// Create a main test function to demonstrate the memory diagnostics
+// This can be used for standalone testing of the memory allocator
+#ifdef DIAGNOSTIC_TEST_MAIN
+int main(int argc, char **argv) {
+    printf("Starting memory allocator diagnostic test\n");
+    
+    // Initialize the memory allocator
+    if (mm_init() < 0) {
+        printf("Error initializing memory allocator\n");
+        return -1;
+    }
+    
+    printf("\nInitial state:\n");
+    mm_print_stats();
+    
+    // Allocate some blocks of different sizes
+    printf("\nAllocating blocks of different sizes...\n");
+    void *p1 = mm_malloc(32);    // Small block
+    void *p2 = mm_malloc(128);   // Medium block
+    void *p3 = mm_malloc(2048);  // Large block
+    void *p4 = mm_malloc(64);    // Small-medium block
+    
+    printf("\nAfter allocations:\n");
+    mm_print_stats();
+    
+    // Free some blocks to create holes
+    printf("\nFreeing some blocks to create holes...\n");
+    mm_free(p2);
+    mm_free(p4);
+    
+    printf("\nAfter freeing some blocks:\n");
+    mm_print_stats();
+    
+    // Allocate a block that should trigger coalescing
+    printf("\nAllocating a block that should fit in a coalesced hole...\n");
+    void *p5 = mm_malloc(100);
+    
+    printf("\nAfter allocation in a hole:\n");
+    mm_print_stats();
+    
+    // Try a reallocation
+    printf("\nReallocating a block to a larger size...\n");
+    p3 = mm_realloc(p3, 4096);
+    
+    printf("\nAfter reallocation:\n");
+    mm_print_stats();
+    
+    // Allocate until we need to extend the heap
+    printf("\nAllocating multiple blocks to force heap extension...\n");
+    void *blocks[20];
+    for (int i = 0; i < 20; i++) {
+        blocks[i] = mm_malloc(1024);
+    }
+    
+    printf("\nAfter multiple allocations:\n");
+    mm_print_stats();
+    
+    // Free everything
+    printf("\nFreeing all blocks...\n");
+    mm_free(p1);
+    mm_free(p3);
+    mm_free(p5);
+    for (int i = 0; i < 20; i++) {
+        mm_free(blocks[i]);
+    }
+    
+    printf("\nFinal state after freeing everything:\n");
+    mm_print_stats();
+    
+    // Run consistency check
+    printf("\nRunning final consistency check:\n");
+    mm_check();
+    
+    printf("\nMemory allocator diagnostic test complete\n");
+    return 0;
+}
+#endif
