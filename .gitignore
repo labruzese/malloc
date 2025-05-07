@@ -16,5 +16,5 @@
 !.gitignore
 
 # don't ignore allocs directory and all its contents
-!allocs/
-!allocs/**
+!traces/
+!traces/**
