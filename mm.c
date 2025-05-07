@@ -54,6 +54,7 @@ team_t team = {
 
 #define SPLIT_IF_REMAINDER_BIGGER_THAN MINIMUM_UNALLOC // always split free blocks
 #define REALLOC_BUFFER 1                               // request ask*realloc buffer during realloc
+#define SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC CHUNKSIZE // same as other one but for realloc
 #define SPLIT_ON_REALLOC 1 // also split during reallocation expansion / shrinkson
 
 //
@@ -86,16 +87,22 @@ team_t team = {
  * its tuned specifically for the test cases and is disabled by default.
  *
  * Uncomment to enable cheating haha
- */
-// #define CHEAT
+ *
+ * Update: Since updated realloc, this no longer works any better than normal
+ */ 
+//#define CHEAT
 
 #ifdef CHEAT // change to first fit for the last few traces
 
 #define FIT_SEARCH_DEPTH ((alloc_count < 52418) ? (1 << 16) : (0))
 
-#else // always use best fit
+#else // always use best fit ()
 
-#define FIT_SEARCH_DEPTH (1 << 16)
+#define FIT_SEARCH_DEPTH (1 << 16) //best fit
+/* 
+ * Turns out using first fit isn't enough to impact the score but has a slight noticable decrease in memory util and about a 30% decrease in runtime
+ */
+//#define FIT_SEARCH_DEPTH 0 //first fit
 
 #endif /* ifdef CHEAT */
 
@@ -375,13 +382,194 @@ void mm_free(void *bp) {
     WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
 
     coalesce(bp);
-    mm_check();
 }
 
 /*
  * Reallocate a block to a new size (return new pointer)
  */
 void *mm_realloc(void *ptr, size_t size) {
+    // Case 1: If ptr is NULL, equivalent to malloc(size)
+    if (ptr == NULL)
+        return mm_malloc(size);
+
+    // Case 2: If size is 0, equivalent to free(ptr) and return NULL
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    // Get the current block size
+    size_t old_size = GET_SIZE(HDR_PTR(ptr));
+
+    // Calculate adjusted size for new block
+    size_t asize;
+    if (size <= DSIZE)
+        asize = 2 * DSIZE;
+    else
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+
+    // If new size is smaller or equal to old size (minus header and footer)
+    if (asize <= old_size) {
+// Optionally split if remaining space is large enough
+#if SPLIT_ON_REALLOC
+        if ((old_size - asize) >= SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC) {
+            WRITE(HDR_PTR(ptr), HEADER(asize, ALLOCATED));
+            WRITE(FTR_PTR(ptr), HEADER(asize, ALLOCATED));
+
+            // Create a free block from the remaining space
+            block *next_bp = PTR_NEXT_BLK(ptr);
+            WRITE(HDR_PTR(next_bp), HEADER(old_size - asize, UNALLOCATED));
+            WRITE(FTR_PTR(next_bp), HEADER(old_size - asize, UNALLOCATED));
+
+            // Add the free block to the appropriate free list
+            insert_free_block(next_bp);
+        }
+#endif
+        return ptr;
+    }
+
+    // Attempt in-place expansion
+    size_t next_alloc = GET_ALLOC(HDR_PTR(PTR_NEXT_BLK(ptr)));
+    size_t prev_alloc = GET_ALLOC(FTR_PTR(PTR_PREV_BLK(ptr))) || PTR_PREV_BLK(ptr) == ptr;
+    size_t next_size = 0;
+    size_t prev_size = 0;
+
+    // Get sizes of adjacent blocks if they're free
+    if (!next_alloc)
+        next_size = GET_SIZE(HDR_PTR(PTR_NEXT_BLK(ptr)));
+    if (!prev_alloc)
+        prev_size = GET_SIZE(HDR_PTR(PTR_PREV_BLK(ptr)));
+
+    // Case 1: Next block is free and combined size is sufficient
+    if (!next_alloc && (old_size + next_size >= asize)) {
+        // Remove next block from free list
+        remove_free_block(PTR_NEXT_BLK(ptr));
+
+        // Combine current block with next block
+        WRITE(HDR_PTR(ptr), HEADER(old_size + next_size, ALLOCATED));
+        WRITE(FTR_PTR(ptr), HEADER(old_size + next_size, ALLOCATED));
+
+// Optionally split if there's enough extra space
+#if SPLIT_ON_REALLOC
+        if ((old_size + next_size - asize) >= SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC) {
+            WRITE(HDR_PTR(ptr), HEADER(asize, ALLOCATED));
+            WRITE(FTR_PTR(ptr), HEADER(asize, ALLOCATED));
+
+            // Create a free block from the remaining space
+            block *split_bp = PTR_NEXT_BLK(ptr);
+            WRITE(HDR_PTR(split_bp), HEADER(old_size + next_size - asize, UNALLOCATED));
+            WRITE(FTR_PTR(split_bp), HEADER(old_size + next_size - asize, UNALLOCATED));
+
+            // Add the free block to the appropriate free list
+            insert_free_block(split_bp);
+        }
+#endif
+
+        return ptr;
+    }
+
+    // Case 2: Previous block is free and combined size is sufficient
+    if (!prev_alloc && (prev_size + old_size >= asize)) {
+        // Remove previous block from free list
+        remove_free_block(PTR_PREV_BLK(ptr));
+
+        // Calculate payload size to copy (excluding header/footer)
+        size_t payload_size = old_size - DSIZE;
+        if (size < payload_size)
+            payload_size = size;
+
+        // Save location of previous block
+        block *prev_bp = PTR_PREV_BLK(ptr);
+
+        // Combine previous and current blocks
+        WRITE(HDR_PTR(prev_bp), HEADER(prev_size + old_size, ALLOCATED));
+        WRITE(FTR_PTR(prev_bp), HEADER(prev_size + old_size, ALLOCATED));
+
+        // Copy data from old location to new location
+        memmove(prev_bp, ptr, payload_size);
+
+// Optionally split if there's enough extra space
+#if SPLIT_ON_REALLOC
+        if ((prev_size + old_size - asize) >= SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC) {
+            WRITE(HDR_PTR(prev_bp), HEADER(asize, ALLOCATED));
+            WRITE(FTR_PTR(prev_bp), HEADER(asize, ALLOCATED));
+
+            // Create a free block from the remaining space
+            block *split_bp = PTR_NEXT_BLK(prev_bp);
+            WRITE(HDR_PTR(split_bp), HEADER(prev_size + old_size - asize, UNALLOCATED));
+            WRITE(FTR_PTR(split_bp), HEADER(prev_size + old_size - asize, UNALLOCATED));
+
+            // Add the free block to the appropriate free list
+            insert_free_block(split_bp);
+        }
+#endif
+
+        return prev_bp;
+    }
+
+    // Case 3: Both previous and next blocks are free and combined size is sufficient
+    if (!prev_alloc && !next_alloc && (prev_size + old_size + next_size >= asize)) {
+        // Remove previous and next blocks from free lists
+        remove_free_block(PTR_PREV_BLK(ptr));
+        remove_free_block(PTR_NEXT_BLK(ptr));
+
+        // Calculate payload size to copy (excluding header/footer)
+        size_t payload_size = old_size - DSIZE;
+        if (size < payload_size)
+            payload_size = size;
+
+        // Save location of previous block
+        block *prev_bp = PTR_PREV_BLK(ptr);
+
+        // Combine all three blocks
+        WRITE(HDR_PTR(prev_bp), HEADER(prev_size + old_size + next_size, ALLOCATED));
+        WRITE(FTR_PTR(prev_bp), HEADER(prev_size + old_size + next_size, ALLOCATED));
+
+        // Copy data from old location to new location
+        memmove(prev_bp, ptr, payload_size);
+
+// Optionally split if there's enough extra space
+#if SPLIT_ON_REALLOC
+        if ((prev_size + old_size + next_size - asize) >= SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC) {
+            WRITE(HDR_PTR(prev_bp), HEADER(asize, ALLOCATED));
+            WRITE(FTR_PTR(prev_bp), HEADER(asize, ALLOCATED));
+
+            // Create a free block from the remaining space
+            block *split_bp = PTR_NEXT_BLK(prev_bp);
+            WRITE(HDR_PTR(split_bp), HEADER(prev_size + old_size + next_size - asize, UNALLOCATED));
+            WRITE(FTR_PTR(split_bp), HEADER(prev_size + old_size + next_size - asize, UNALLOCATED));
+
+            // Add the free block to the appropriate free list
+            insert_free_block(split_bp);
+        }
+#endif
+
+        return prev_bp;
+    }
+
+    // Case 4: No in-place expansion possible, allocate new block
+    block *new_bp;
+
+// Apply the REALLOC_BUFFER policy if desired
+#if REALLOC_BUFFER
+    new_bp = mm_malloc(size * REALLOC_BUFFER);
+#else
+    new_bp = mm_malloc(size);
+#endif
+
+    if (new_bp == NULL)
+        return NULL;
+
+    // Copy the data to the new block
+    size_t copy_size = old_size - DSIZE; // Subtract header and footer
+    if (size < copy_size)
+        copy_size = size;
+    memcpy(new_bp, ptr, copy_size);
+
+    // Free the old block
+    mm_free(ptr);
+
+    return new_bp;
 }
 
 /*
