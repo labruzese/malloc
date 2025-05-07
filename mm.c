@@ -55,7 +55,7 @@ team_t team = {
 #define SPLIT_IF_REMAINDER_BIGGER_THAN MINIMUM_UNALLOC // always split free blocks
 #define REALLOC_BUFFER 1                               // request ask*realloc buffer during realloc
 #define SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC CHUNKSIZE // same as other one but for realloc
-#define SPLIT_ON_REALLOC 1 // also split during reallocation expansion / shrinkson
+#define SPLIT_ON_REALLOC 1 // also split during reallocation expansion / shrinks
 
 //
 /*
@@ -270,12 +270,261 @@ static int mm_check();
 #define SMALL_INIT_SIZE 256 // size of each small block in bytes
 #define SMALL_INIT_AMT 0    // number of small blocks to create
 
+//=============================================================================
+// MEMORY DIAGNOSTICS SECTION
+//=============================================================================
+
+// Diagnostic counters for tracking memory usage
+static struct {
+    // General statistics
+    size_t total_heap_size;            // Total size of heap
+    size_t max_heap_size;              // Maximum heap size observed
+    unsigned long malloc_calls;         // Number of malloc calls
+    unsigned long free_calls;           // Number of free calls  
+    unsigned long realloc_calls;        // Number of realloc calls
+    unsigned long extend_heap_calls;    // Number of heap extensions
+    
+    // Memory usage statistics
+    size_t current_allocated;           // Current bytes allocated
+    size_t max_allocated;               // Maximum bytes allocated at once
+    size_t total_allocated;             // Total bytes ever allocated
+    size_t total_requested;             // Total bytes requested by user
+    size_t current_free;                // Current bytes in free blocks
+    
+    // Waste tracking
+    size_t internal_fragmentation;      // Wasted space in allocated blocks
+    size_t external_fragmentation;      // Unusable free space due to fragmentation
+    size_t overhead_bytes;              // Space used for headers, footers, pointers 
+    size_t padding_waste;               // Waste due to alignment/padding
+    
+    // Allocation size tracking
+    unsigned long allocs_by_size[32];   // Count allocations in power-of-2 size buckets
+    
+    // Fragmentation tracking
+    unsigned long free_blocks;          // Number of free blocks
+    unsigned long small_free_blocks;    // Number of small free blocks (< 64 bytes)
+    
+    // Split/coalesce statistics
+    unsigned long block_splits;         // Number of blocks split
+    unsigned long block_coalesces;      // Number of blocks coalesced 
+    
+    // Right vs left allocation
+    unsigned long right_allocations;    // Number of right-side allocations
+    unsigned long left_allocations;     // Number of left-side allocations
+    
+    // Search efficiency
+    unsigned long search_depth_sum;     // Sum of depths searched
+    unsigned long searches;             // Number of searches performed
+    
+    // Time-based statistics (not implemented, would need timer)
+} stats = {0};
+
+// Determine bucket for allocation size tracking
+static int get_size_bucket(size_t size) {
+    // Returns the log base 2 bucket for the size
+    if (size == 0) return 0;
+    size_t bucket = 0;
+    size_t temp = size;
+    while (temp > 1) {
+        temp >>= 1;
+        bucket++;
+    }
+    return bucket < 31 ? bucket : 31; // Cap at 31 for very large sizes
+}
+
+// Reset statistics
+void mm_reset_stats() {
+    memset(&stats, 0, sizeof(stats));
+}
+
+// Print memory usage statistics
+void mm_print_stats() {
+    printf("\n==============================================\n");
+    printf("MEMORY ALLOCATOR STATISTICS\n");
+    printf("==============================================\n");
+    
+    // General statistics
+    printf("\nGENERAL STATISTICS:\n");
+    printf("  Current heap size: %zu bytes\n", stats.total_heap_size);
+    printf("  Maximum heap size: %zu bytes\n", stats.max_heap_size);
+    printf("  Total malloc calls: %lu\n", stats.malloc_calls);
+    printf("  Total free calls: %lu\n", stats.free_calls);
+    printf("  Total realloc calls: %lu\n", stats.realloc_calls);
+    printf("  Heap extensions: %lu\n", stats.extend_heap_calls);
+    
+    // Memory usage
+    printf("\nMEMORY USAGE:\n");
+    printf("  Currently allocated: %zu bytes (%.2f%% of heap)\n", 
+           stats.current_allocated, 
+           stats.total_heap_size ? 100.0 * stats.current_allocated / stats.total_heap_size : 0.0);
+    printf("  Maximum allocated: %zu bytes\n", stats.max_allocated);
+    printf("  Total bytes requested by user: %zu bytes\n", stats.total_requested);
+    printf("  Currently in free blocks: %zu bytes (%.2f%% of heap)\n", 
+           stats.current_free,
+           stats.total_heap_size ? 100.0 * stats.current_free / stats.total_heap_size : 0.0);
+    
+    // Waste analysis
+    printf("\nMEMORY WASTE ANALYSIS:\n");
+    printf("  Internal fragmentation: %zu bytes (%.2f%% of allocated)\n", 
+           stats.internal_fragmentation,
+           stats.current_allocated ? 100.0 * stats.internal_fragmentation / stats.current_allocated : 0.0);
+    printf("  External fragmentation: %zu bytes (%.2f%% of free space)\n", 
+           stats.external_fragmentation,
+           stats.current_free ? 100.0 * stats.external_fragmentation / stats.current_free : 0.0);
+    printf("  Overhead (headers/footers/pointers): %zu bytes (%.2f%% of heap)\n", 
+           stats.overhead_bytes,
+           stats.total_heap_size ? 100.0 * stats.overhead_bytes / stats.total_heap_size : 0.0);
+    printf("  Padding waste: %zu bytes\n", stats.padding_waste);
+    
+    // Utilization
+    double util = stats.total_heap_size ? 
+        (double)(stats.total_heap_size - stats.overhead_bytes - stats.internal_fragmentation - 
+                stats.external_fragmentation) / stats.total_heap_size : 0.0;
+    printf("  Memory utilization: %.2f%%\n", util * 100.0);
+    
+    // Blocks analysis
+    printf("\nBLOCKS ANALYSIS:\n");
+    printf("  Free blocks: %lu\n", stats.free_blocks);
+    printf("  Small free blocks (< 64 bytes): %lu (%.2f%% of free blocks)\n", 
+           stats.small_free_blocks,
+           stats.free_blocks ? 100.0 * stats.small_free_blocks / stats.free_blocks : 0.0);
+    printf("  Block splits: %lu\n", stats.block_splits);
+    printf("  Block coalesces: %lu\n", stats.block_coalesces);
+    
+    // Allocation policy analysis
+    printf("\nALLOCATION POLICY ANALYSIS:\n");
+    printf("  Right-side allocations: %lu (%.2f%%)\n", 
+           stats.right_allocations,
+           stats.right_allocations + stats.left_allocations ? 
+           100.0 * stats.right_allocations / (stats.right_allocations + stats.left_allocations) : 0.0);
+    printf("  Left-side allocations: %lu (%.2f%%)\n", 
+           stats.left_allocations,
+           stats.right_allocations + stats.left_allocations ? 
+           100.0 * stats.left_allocations / (stats.right_allocations + stats.left_allocations) : 0.0);
+    
+    // Search efficiency
+    printf("\nSEARCH EFFICIENCY:\n");
+    printf("  Average search depth: %.2f\n", 
+           stats.searches ? (double)stats.search_depth_sum / stats.searches : 0.0);
+    
+    // Top allocation sizes
+    printf("\nALLOCATION SIZE DISTRIBUTION:\n");
+    printf("  Size bucket               Count    Percentage\n");
+    printf("  -----------------------------------------\n");
+    
+    unsigned long total_allocs = 0;
+    for (int i = 0; i < 32; i++) {
+        total_allocs += stats.allocs_by_size[i];
+    }
+    
+    for (int i = 0; i < 32; i++) {
+        if (stats.allocs_by_size[i] > 0) {
+            printf("  %4d-%4d bytes: %10lu    %.2f%%\n", 
+                  i > 0 ? (1 << (i-1)) : 0, 
+                  (1 << i) - 1,
+                  stats.allocs_by_size[i],
+                  total_allocs ? 100.0 * stats.allocs_by_size[i] / total_allocs : 0.0);
+        }
+    }
+    
+    printf("\n==============================================\n");
+}
+
+// Calculate internal fragmentation (wasted space within allocated blocks)
+static void update_internal_fragmentation() {
+    stats.internal_fragmentation = 0;
+    
+    // Walk the heap to find all allocated blocks
+    block *bp = heap_listp;
+    while (GET_SIZE(HDR_PTR(bp)) > 0) {
+        if (GET_ALLOC(HDR_PTR(bp))) {
+            size_t block_size = GET_SIZE(HDR_PTR(bp));
+            // Calculate payload size by assuming payload + padding
+            size_t payload_size = block_size - DSIZE; // header + footer
+            
+            // Find previous allocation request that resulted in this block
+            // This is approximate; a more accurate way would be to track each block
+            stats.internal_fragmentation += block_size - payload_size;
+        }
+        bp = PTR_NEXT_BLK(bp);
+    }
+}
+
+// Update statistics on free blocks
+static void update_free_block_stats() {
+    stats.free_blocks = 0;
+    stats.small_free_blocks = 0;
+    stats.current_free = 0;
+    stats.external_fragmentation = 0;
+    
+    // Scan the segregated lists
+    for (int i = 0; i < NUM_LISTS; i++) {
+        block *bp = get_seg_list(i);
+        while (bp != NULL) {
+            size_t size = GET_SIZE(HDR_PTR(bp));
+            stats.free_blocks++;
+            stats.current_free += size;
+            
+            // Count small blocks
+            if (size < 64) {
+                stats.small_free_blocks++;
+                stats.external_fragmentation += size; // Small blocks often contribute to external fragmentation
+            }
+            
+            bp = GET_NEXT(bp);
+        }
+    }
+}
+
+// Update overhead statistics
+static void update_overhead_stats() {
+    stats.overhead_bytes = 0;
+    
+    // Walk the heap to compute overhead
+    block *bp = heap_listp;
+    while (GET_SIZE(HDR_PTR(bp)) > 0) {
+        size_t block_size = GET_SIZE(HDR_PTR(bp));
+        if (GET_ALLOC(HDR_PTR(bp))) {
+            // Allocated blocks have header and footer overhead
+            stats.overhead_bytes += DSIZE; // header + footer
+        } else {
+            // Free blocks have header, footer, and pointers overhead
+            stats.overhead_bytes += DSIZE + 2 * sizeof(block *); // header + footer + prev + next
+        }
+        bp = PTR_NEXT_BLK(bp);
+    }
+}
+
+// Update all statistics (call periodically)
+static void update_all_stats() {
+    // Update heap size
+    stats.total_heap_size = mem_heapsize();
+    if (stats.total_heap_size > stats.max_heap_size)
+        stats.max_heap_size = stats.total_heap_size;
+    
+    // Update internal fragmentation
+    update_internal_fragmentation();
+    
+    // Update free block statistics
+    update_free_block_stats();
+    
+    // Update overhead statistics
+    update_overhead_stats();
+}
+
+//=============================================================================
+// END OF MEMORY DIAGNOSTICS SECTION
+//=============================================================================
+
 /*
  * Initialize the memory manager
  *
  * Create prologue and epilogue, then add a new page. 0 for successful init, -1 for unsuccessful.
  */
 int mm_init(void) {
+    // Reset statistics
+    mm_reset_stats();
+    
     // initialize all segregated free lists to NULL
     for (int i = 0; i < NUM_LISTS; i++) {
         set_seg_list(i, NULL);
@@ -291,6 +540,9 @@ int mm_init(void) {
     WRITE(heap_listp + (3 * WSIZE), HEADER(0, ALLOCATED));     // epilogue header
     heap_listp += (2 * WSIZE);                                 // point to prologue footer
 
+    // Update overhead tracking
+    stats.overhead_bytes += 4 * WSIZE;
+    
     // extend the empty heap with a free block of CHUNKSIZE bytes
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
@@ -324,6 +576,9 @@ int mm_init(void) {
         WRITE(FTR_PTR(bp), HEADER(remaining_size, UNALLOCATED));
         insert_free_block(bp);
     }
+    
+    // Update initial statistics
+    update_all_stats();
 
     return 0;
 }
@@ -335,7 +590,10 @@ void *mm_malloc(size_t size) {
     size_t asize;      // adjusted block size
     size_t extendsize; // amount to extend heap if no fit
     block *bp;
-
+    
+    // Update statistics
+    stats.malloc_calls++;
+    
     if (size == 0)
         return NULL;
 
@@ -344,10 +602,26 @@ void *mm_malloc(size_t size) {
         asize = 2 * DSIZE;
     else
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    
+    // Update statistics
+    stats.total_requested += size;
+    stats.allocs_by_size[get_size_bucket(size)]++;
+    stats.padding_waste += asize - size;
 
     // search the free list for a fit
     if ((bp = find_fit(asize)) != NULL) {
-        return place(bp, asize);
+        void *allocated = place(bp, asize);
+        
+        // Update statistics
+        stats.current_allocated += asize;
+        if (stats.current_allocated > stats.max_allocated)
+            stats.max_allocated = stats.current_allocated;
+        stats.total_allocated += asize;
+        
+        // Update comprehensive statistics
+        update_all_stats();
+        
+        return allocated;
     }
 
     // no fit found. get more memory and place the block
@@ -365,8 +639,22 @@ void *mm_malloc(size_t size) {
     // fflush(stdout);
     // if(alloc_count % 1 == 0) printf("alloc_count: %d\n", alloc_count);
 #endif
+    
+    // Place the block
+    void *allocated = place(bp, asize);
+    
+    // Update statistics
+    stats.current_allocated += asize;
+    if (stats.current_allocated > stats.max_allocated)
+        stats.max_allocated = stats.current_allocated;
+    stats.total_allocated += asize;
+    
+    // Update comprehensive statistics
+    update_all_stats();
 
-    return place(bp, asize);
+    mm_print_stats();
+
+    return allocated;
 }
 
 /*
@@ -375,19 +663,28 @@ void *mm_malloc(size_t size) {
 void mm_free(void *bp) {
     if (bp == NULL)
         return;
-
+    
+    // Update statistics
+    stats.free_calls++;
     size_t size = GET_SIZE(HDR_PTR(bp));
+    stats.current_allocated -= size;
 
     WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
     WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
 
     coalesce(bp);
+    
+    // Update comprehensive statistics
+    update_all_stats();
 }
 
 /*
  * Reallocate a block to a new size (return new pointer)
  */
 void *mm_realloc(void *ptr, size_t size) {
+    // Update statistics
+    stats.realloc_calls++;
+    
     // Case 1: If ptr is NULL, equivalent to malloc(size)
     if (ptr == NULL)
         return mm_malloc(size);
@@ -407,9 +704,18 @@ void *mm_realloc(void *ptr, size_t size) {
         asize = 2 * DSIZE;
     else
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    
+    // Update statistics
+    stats.total_requested += size;
+    stats.padding_waste += asize - size;
+    stats.allocs_by_size[get_size_bucket(size)]++;
 
     // If new size is smaller or equal to old size (minus header and footer)
     if (asize <= old_size) {
+        // Update statistics for current allocation
+        stats.current_allocated -= old_size;
+        stats.current_allocated += asize;
+        
 // Optionally split if remaining space is large enough
 #if SPLIT_ON_REALLOC
         if ((old_size - asize) >= SPLIT_IF_REMAINDER_BIGGER_THAN_REALLOC) {
@@ -423,8 +729,13 @@ void *mm_realloc(void *ptr, size_t size) {
 
             // Add the free block to the appropriate free list
             insert_free_block(next_bp);
+            
+            // Update statistics
+            stats.block_splits++;
         }
 #endif
+        // Update comprehensive statistics
+        update_all_stats();
         return ptr;
     }
 
@@ -448,6 +759,11 @@ void *mm_realloc(void *ptr, size_t size) {
         // Combine current block with next block
         WRITE(HDR_PTR(ptr), HEADER(old_size + next_size, ALLOCATED));
         WRITE(FTR_PTR(ptr), HEADER(old_size + next_size, ALLOCATED));
+        
+        // Update statistics
+        stats.current_allocated -= old_size;
+        stats.current_allocated += (old_size + next_size);
+        stats.block_coalesces++;
 
 // Optionally split if there's enough extra space
 #if SPLIT_ON_REALLOC
@@ -462,9 +778,15 @@ void *mm_realloc(void *ptr, size_t size) {
 
             // Add the free block to the appropriate free list
             insert_free_block(split_bp);
+            
+            // Update statistics
+            stats.current_allocated -= (old_size + next_size);
+            stats.current_allocated += asize;
+            stats.block_splits++;
         }
 #endif
-
+        // Update comprehensive statistics
+        update_all_stats();
         return ptr;
     }
 
@@ -487,6 +809,11 @@ void *mm_realloc(void *ptr, size_t size) {
 
         // Copy data from old location to new location
         memmove(prev_bp, ptr, payload_size);
+        
+        // Update statistics
+        stats.current_allocated -= old_size;
+        stats.current_allocated += (prev_size + old_size);
+        stats.block_coalesces++;
 
 // Optionally split if there's enough extra space
 #if SPLIT_ON_REALLOC
@@ -501,9 +828,15 @@ void *mm_realloc(void *ptr, size_t size) {
 
             // Add the free block to the appropriate free list
             insert_free_block(split_bp);
+            
+            // Update statistics
+            stats.current_allocated -= (prev_size + old_size);
+            stats.current_allocated += asize;
+            stats.block_splits++;
         }
 #endif
-
+        // Update comprehensive statistics  
+        update_all_stats();
         return prev_bp;
     }
 
@@ -527,6 +860,11 @@ void *mm_realloc(void *ptr, size_t size) {
 
         // Copy data from old location to new location
         memmove(prev_bp, ptr, payload_size);
+        
+        // Update statistics  
+        stats.current_allocated -= old_size;
+        stats.current_allocated += (prev_size + old_size + next_size);
+        stats.block_coalesces += 2;
 
 // Optionally split if there's enough extra space
 #if SPLIT_ON_REALLOC
@@ -541,9 +879,15 @@ void *mm_realloc(void *ptr, size_t size) {
 
             // Add the free block to the appropriate free list
             insert_free_block(split_bp);
+            
+            // Update statistics
+            stats.current_allocated -= (prev_size + old_size + next_size);
+            stats.current_allocated += asize;
+            stats.block_splits++;
         }
 #endif
-
+        // Update comprehensive statistics
+        update_all_stats();
         return prev_bp;
     }
 
@@ -568,6 +912,9 @@ void *mm_realloc(void *ptr, size_t size) {
 
     // Free the old block
     mm_free(ptr);
+    
+    // Update comprehensive statistics
+    update_all_stats();
 
     return new_bp;
 }
@@ -578,6 +925,9 @@ void *mm_realloc(void *ptr, size_t size) {
 static void *extend_heap(size_t words) {
     block *bp;
     size_t size;
+    
+    // Update statistics
+    stats.extend_heap_calls++;
 
     // allocate an even number of words to maintain alignment
     size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
@@ -591,6 +941,12 @@ static void *extend_heap(size_t words) {
     WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));          // free block header
     WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));          // free block footer
     WRITE(HDR_PTR(PTR_NEXT_BLK(bp)), HEADER(0, ALLOCATED)); // new next header
+    
+    // Update statistics
+    stats.total_heap_size += size;
+    if (stats.total_heap_size > stats.max_heap_size)
+        stats.max_heap_size = stats.total_heap_size;
+    stats.overhead_bytes += DSIZE; // header + footer for the new block
 
     // coalesce if the previous block was free
     return coalesce(bp);
@@ -616,6 +972,7 @@ static void *coalesce(void *bp) {
         remove_free_block(PTR_NEXT_BLK(bp));
         WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
         WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
+        stats.block_coalesces++;
     }
 
     // case 3: prev is free, next is allocated
@@ -625,6 +982,7 @@ static void *coalesce(void *bp) {
         bp = PTR_PREV_BLK(bp);
         WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
         WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
+        stats.block_coalesces++;
     }
 
     // case 4: both prev and next blocks are free
@@ -635,6 +993,7 @@ static void *coalesce(void *bp) {
         bp = PTR_PREV_BLK(bp);
         WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
         WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
+        stats.block_coalesces += 2;
     }
 
     insert_free_block(bp);
@@ -657,16 +1016,15 @@ static void *place(block *bp, size_t asize) {
 #ifdef USE_ALT
 
         if (alt) { // alternate right allocation
-
+            stats.right_allocations++;
 #else // NDEF USE_ALT
 #ifdef LARGE_OBJECT_THRESHOLD
 
         if (asize > LARGE_OBJECT_THRESHOLD) { // right allocate if large object
-
+            stats.right_allocations++;
 #else // NDEF LARGE_OBJECT_THRESHOLD
 
         if (0) { // don't allocate to right side
-
 #endif
 #endif
             // Save the location where the allocated block will go
@@ -685,6 +1043,7 @@ static void *place(block *bp, size_t asize) {
         }
         // For smaller objects, place them on the left side (original behavior)
         else {
+            stats.left_allocations++;
             WRITE(HDR_PTR(bp), HEADER(asize, ALLOCATED));
             WRITE(FTR_PTR(bp), HEADER(asize, ALLOCATED));
 
@@ -696,6 +1055,9 @@ static void *place(block *bp, size_t asize) {
             // Add the free block to the free list
             insert_free_block(free_bp);
         }
+        
+        // Update statistics
+        stats.block_splits++;
     }
 
     // otherwise use the entire block
@@ -705,9 +1067,7 @@ static void *place(block *bp, size_t asize) {
     }
 
 #ifdef USE_ALT
-
     alt = !alt;
-
 #endif /* ifdef USE_ALT */
 
     return allocated_bp;
@@ -723,6 +1083,7 @@ static void *find_fit(size_t asize) {
     block *best_fit = NULL;
     size_t best_size = 0;
     int depth;
+    int total_search_depth = 0;
 
     // search from the appropriate list up through larger lists
     for (int i = list_index; i < NUM_LISTS; i++) {
@@ -732,6 +1093,7 @@ static void *find_fit(size_t asize) {
         // search through the list up to MAX_SEARCH_DEPTH nodes
         while (bp != NULL && (depth < FIT_SEARCH_DEPTH || best_fit == NULL)) {
             size_t current_size = GET_SIZE(HDR_PTR(bp));
+            total_search_depth++;
 
             // check if this block can fit the requested size
             if (asize <= current_size) {
@@ -742,6 +1104,9 @@ static void *find_fit(size_t asize) {
 
                     // if we found an exact match, return immediately
                     if (current_size == asize) {
+                        // Update search statistics
+                        stats.search_depth_sum += total_search_depth;
+                        stats.searches++;
                         return best_fit;
                     }
                 }
@@ -754,10 +1119,17 @@ static void *find_fit(size_t asize) {
 
         // if we found a fit in the current list, return it
         if (best_fit != NULL) {
+            // Update search statistics
+            stats.search_depth_sum += total_search_depth;
+            stats.searches++;
             return best_fit;
         }
     }
 
+    // Update search statistics
+    stats.search_depth_sum += total_search_depth;
+    stats.searches++;
+    
     // no fit found
     return NULL;
 }
@@ -800,11 +1172,13 @@ static void remove_free_block(block *bp) {
 }
 
 /*
- * mm_check - Check the heap for consistency
+ * mm_check - Check the heap for consistency and print diagnostics
  */
 int mm_check(void) {
     void *bp;
     int correct = 1;
+    
+    printf("\n=== MEMORY CONSISTENCY CHECK ===\n");
 
     // check if every block in each free list is marked as free
     for (int i = 0; i < NUM_LISTS; i++) {
@@ -869,6 +1243,16 @@ int mm_check(void) {
             bp = GET_NEXT(bp);
         }
     }
+    
+    // Print summary of check
+    if (correct) {
+        printf("Memory consistency check passed.\n");
+    } else {
+        printf("Memory consistency check failed!\n");
+    }
+    
+    // Also print memory diagnostics
+    mm_print_stats();
 
     return correct;
 }
