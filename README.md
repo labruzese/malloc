@@ -8,7 +8,7 @@ They were quite useful for testing different policies though.
 
 [Source Code](mm.c)
 
-[Original Assignment](https://github.com/labruzese/a5/edit/master/README.md#this-project-was-created-for-this-assignment)
+[Original Assignment](#this-project-was-created-for-this-assignment)
 
 # Table of Contents
 - [A5: Dynamic Storage Allocator](#a5-dynamic-storage-allocator)
