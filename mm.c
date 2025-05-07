@@ -600,44 +600,83 @@ static void *extend_heap(size_t words) {
  * Boundary tag coalescing. Return ptr to coalesced block
  */
 static void *coalesce(void *bp) {
+    printf("\n----- COALESCING BLOCK AT %p -----\n", bp);
+    
     size_t prev_alloc = GET_ALLOC(FTR_PTR(PTR_PREV_BLK(bp))) || PTR_PREV_BLK(bp) == bp;
     size_t next_alloc = GET_ALLOC(HDR_PTR(PTR_NEXT_BLK(bp)));
     size_t size = GET_SIZE(HDR_PTR(bp));
-
-    // case 1: both prev and next blocks are allocated
+    
+    printf("Current block: addr=%p, size=%zu, allocated=%d\n", 
+           bp, size, GET_ALLOC(HDR_PTR(bp)));
+    printf("Prev block: addr=%p, size=%zu, allocated=%d\n", 
+           PTR_PREV_BLK(bp), GET_SIZE(HDR_PTR(PTR_PREV_BLK(bp))), prev_alloc);
+    printf("Next block: addr=%p, size=%zu, allocated=%d\n", 
+           PTR_NEXT_BLK(bp), GET_SIZE(HDR_PTR(PTR_NEXT_BLK(bp))), next_alloc);
+    
+    // Case identification
     if (prev_alloc && next_alloc) {
+        printf("CASE 1: Both neighbors allocated - no coalescing needed\n");
         insert_free_block(bp);
+        printf("Block inserted into free list, addr=%p, size=%zu\n", bp, size);
         return bp;
     }
-
-    // case 2: prev is allocated, next is free
+    
+    // Case 2: prev allocated, next free
     else if (prev_alloc && !next_alloc) {
+        printf("CASE 2: Coalescing with next block\n");
+        printf("Before coalescing - Current: %zu bytes, Next: %zu bytes\n", 
+               size, GET_SIZE(HDR_PTR(PTR_NEXT_BLK(bp))));
+        
         size += GET_SIZE(HDR_PTR(PTR_NEXT_BLK(bp)));
         remove_free_block(PTR_NEXT_BLK(bp));
         WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
         WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
+        
+        printf("After coalescing - New size: %zu bytes\n", size);
+        printf("Verifying header/footer match: HDR=%x, FTR=%x\n", 
+               GET(HDR_PTR(bp)), GET(FTR_PTR(bp)));
     }
-
-    // case 3: prev is free, next is allocated
+    
+    // Case 3: prev free, next allocated
     else if (!prev_alloc && next_alloc) {
+        printf("CASE 3: Coalescing with previous block\n");
+        printf("Before coalescing - Prev: %zu bytes, Current: %zu bytes\n", 
+               GET_SIZE(HDR_PTR(PTR_PREV_BLK(bp))), size);
+        
         size += GET_SIZE(HDR_PTR(PTR_PREV_BLK(bp)));
         remove_free_block(PTR_PREV_BLK(bp));
         bp = PTR_PREV_BLK(bp);
         WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
         WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
+        
+        printf("After coalescing - New size: %zu bytes, New addr: %p\n", size, bp);
+        printf("Verifying header/footer match: HDR=%x, FTR=%x\n", 
+               GET(HDR_PTR(bp)), GET(FTR_PTR(bp)));
     }
-
-    // case 4: both prev and next blocks are free
+    
+    // Case 4: both neighbors free
     else {
+        printf("CASE 4: Coalescing with both prev and next blocks\n");
+        printf("Before coalescing - Prev: %zu, Current: %zu, Next: %zu bytes\n", 
+               GET_SIZE(HDR_PTR(PTR_PREV_BLK(bp))), size, 
+               GET_SIZE(HDR_PTR(PTR_NEXT_BLK(bp))));
+        
         size += GET_SIZE(HDR_PTR(PTR_PREV_BLK(bp))) + GET_SIZE(HDR_PTR(PTR_NEXT_BLK(bp)));
         remove_free_block(PTR_PREV_BLK(bp));
         remove_free_block(PTR_NEXT_BLK(bp));
         bp = PTR_PREV_BLK(bp);
         WRITE(HDR_PTR(bp), HEADER(size, UNALLOCATED));
         WRITE(FTR_PTR(bp), HEADER(size, UNALLOCATED));
+        
+        printf("After coalescing - New size: %zu bytes, New addr: %p\n", size, bp);
+        printf("Verifying header/footer match: HDR=%x, FTR=%x\n", 
+               GET(HDR_PTR(bp)), GET(FTR_PTR(bp)));
     }
-
+    
     insert_free_block(bp);
+    printf("Coalesced block inserted into free list: addr=%p, size=%zu\n", bp, size);
+    printf("------ COALESCING COMPLETE ------\n");
+    
     return bp;
 }
 
