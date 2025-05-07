@@ -8,6 +8,7 @@
 !*.c
 !*.h
 !*.txt
+!*.md
 
 # don't ignore these specific files
 !Makefile
