@@ -1,0 +1,19 @@
+# Ignore everything
+*
+
+# don't ignore directories so we can recurse into them
+!*/
+
+# don't ignore these specific file types
+!*.c
+!*.h
+!*.txt
+
+# don't ignore these specific files
+!Makefile
+!README
+!.gitignore
+
+# don't ignore allocs directory and all its contents
+!allocs/
+!allocs/**
